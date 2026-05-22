@@ -2004,10 +2004,16 @@ class AIAgent:
                 self._user_profile_enabled = mem_config.get("user_profile_enabled", False)
                 self._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
                 if self._memory_enabled or self._user_profile_enabled:
-                    from tools.memory_tool import MemoryStore
+                    from tools.memory_tool import MemoryStore, MemoryScope
+                    _mem_scope = (
+                        MemoryScope.user(self._user_id, self.platform)
+                        if self._user_id and self.platform
+                        else MemoryScope.default()
+                    )
                     self._memory_store = MemoryStore(
                         memory_char_limit=mem_config.get("memory_char_limit", 2200),
                         user_char_limit=mem_config.get("user_char_limit", 1375),
+                        scope=_mem_scope,
                     )
                     self._memory_store.load_from_disk()
             except Exception:
@@ -4362,6 +4368,9 @@ class AIAgent:
                     review_agent._memory_write_origin = "background_review"
                     review_agent._memory_write_context = "background_review"
                     review_agent._memory_store = self._memory_store
+                    review_agent._user_id = self._user_id
+                    review_agent._platform = self.platform
+                    review_agent._chat_id = self._chat_id
                     review_agent._memory_enabled = self._memory_enabled
                     review_agent._user_profile_enabled = self._user_profile_enabled
                     review_agent._memory_nudge_interval = 0

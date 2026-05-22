@@ -23,15 +23,17 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import hashlib
 import json
 import logging
 import os
 import re
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Literal, Optional
 
 from utils import atomic_replace
 
@@ -57,6 +59,111 @@ def get_memory_dir() -> Path:
     return get_hermes_home() / "memories"
 
 ENTRY_DELIMITER = "\n§\n"
+
+MIGRATION_SENTINEL = get_memory_dir() / "MIGRATED"
+
+
+@dataclass(frozen=True)
+class MemoryScope:
+    """Explicit scoping for per-user memory isolation.
+
+    Use factory methods instead of the constructor directly:
+      - ``MemoryScope.user(user_id, platform)`` — per-user isolation
+      - ``MemoryScope.default()`` — fallback for callers without user context
+    """
+
+    user_id: Optional[str]
+    platform: Optional[str]
+    scope_type: Literal["user", "default"]
+
+    @classmethod
+    def user(cls, user_id: str, platform: str) -> "MemoryScope":
+        return cls(user_id=user_id, platform=platform, scope_type="user")
+
+    @classmethod
+    def default(cls) -> "MemoryScope":
+        return cls(user_id=None, platform=None, scope_type="default")
+
+
+def user_memory_dir(scope: "MemoryScope") -> Path:
+    """Return the per-user memory subdirectory.
+
+    - scope_type="user" → u_<platform>_<sha256(platform:user_id)>/   (full 64-char hex)
+    - scope_type="default" → default/                                 (logs warning)
+    """
+    if scope.scope_type == "user":
+        assert scope.user_id and scope.platform, (
+            "MemoryScope.user() requires both user_id and platform"
+        )
+        h = hashlib.sha256(f"{scope.platform}:{scope.user_id}".encode()).hexdigest()
+        name = f"u_{scope.platform}_{h}"
+    else:
+        logger.warning(
+            "Memory isolation falling back to default/ "
+            "(scope_type=%s, user_id=%s, platform=%s). "
+            "All callers without explicit user identity share this memory space.",
+            scope.scope_type,
+            scope.user_id,
+            scope.platform,
+        )
+        name = "default"
+    return get_memory_dir() / name
+
+
+def _migrate_legacy_files() -> None:
+    """Migrate flat MEMORY.md/USER.md into the default/ subdirectory.
+
+    Uses a global migration lock + double-checked sentinel to prevent
+    races between concurrent processes.  Safe to call on every startup
+    — idempotent after the first successful migration.
+    """
+    if MIGRATION_SENTINEL.exists():
+        return
+
+    lock_file = get_memory_dir() / ".migration.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if fcntl is None:
+        _migrate_do(get_memory_dir())
+        return
+
+    fd = open(lock_file, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        # Double-check after acquiring the lock
+        if not MIGRATION_SENTINEL.exists():
+            _migrate_do(get_memory_dir())
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+
+
+def _migrate_do(mem_dir: Path) -> None:
+    """Perform the one-way migration (caller must hold the migration lock)."""
+    flat_mem = mem_dir / "MEMORY.md"
+    flat_user = mem_dir / "USER.md"
+
+    if not flat_mem.exists() and not flat_user.exists():
+        MIGRATION_SENTINEL.touch()
+        return
+
+    default_dir = mem_dir / "default"
+    default_dir.mkdir(parents=True, exist_ok=True)
+
+    for fname in ("MEMORY.md", "USER.md"):
+        flat = mem_dir / fname
+        target = default_dir / fname
+        if flat.exists():
+            if target.exists():
+                # Merge defensively (should be rare); preserve insertion order
+                existing = MemoryStore._read_file(target)
+                incoming = MemoryStore._read_file(flat)
+                merged = list(dict.fromkeys(existing + incoming))
+                MemoryStore._write_file(target, merged)
+            else:
+                flat.rename(target)
+
+    MIGRATION_SENTINEL.touch()
 
 
 # ---------------------------------------------------------------------------
@@ -115,21 +222,44 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375,
+                 *, scope: Optional["MemoryScope"] = None):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        # Per-user memory isolation — resolve scope from arg → env var → default
+        if scope is None:
+            ctx = os.environ.get("HERMES_MEMORY_CONTEXT")
+            if ctx:
+                try:
+                    data = json.loads(ctx)
+                    uid = data.get("user_id")
+                    plat = data.get("platform")
+                    if uid and plat:
+                        scope = MemoryScope.user(uid, plat)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        if scope is None:
+            scope = MemoryScope.default()
+        self._scope = scope
+        self._user_mem_dir: Optional[Path] = None  # resolved lazily
+
+    def _resolve_user_dir(self) -> Path:
+        if self._user_mem_dir is None:
+            self._user_mem_dir = user_memory_dir(self._scope)
+        return self._user_mem_dir
 
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
-        mem_dir = get_memory_dir()
-        mem_dir.mkdir(parents=True, exist_ok=True)
+        _migrate_legacy_files()
+        user_dir = self._resolve_user_dir()
+        user_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+        self.memory_entries = self._read_file(user_dir / "MEMORY.md")
+        self.user_entries = self._read_file(user_dir / "USER.md")
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
@@ -175,12 +305,11 @@ class MemoryStore:
                     pass
             fd.close()
 
-    @staticmethod
-    def _path_for(target: str) -> Path:
-        mem_dir = get_memory_dir()
+    def _path_for(self, target: str) -> Path:
+        user_dir = self._resolve_user_dir()
         if target == "user":
-            return mem_dir / "USER.md"
-        return mem_dir / "MEMORY.md"
+            return user_dir / "USER.md"
+        return user_dir / "MEMORY.md"
 
     def _reload_target(self, target: str):
         """Re-read entries from disk into in-memory state.
@@ -193,7 +322,7 @@ class MemoryStore:
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
-        get_memory_dir().mkdir(parents=True, exist_ok=True)
+        self._resolve_user_dir().mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
 
     def _entries_for(self, target: str) -> List[str]:
